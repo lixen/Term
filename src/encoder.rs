@@ -52,7 +52,8 @@ impl<'a> Encoder<'a> {
     let type_name_ref: &str = type_name.as_ref();
     match type_name_ref {
       "int" => {
-        return self.write_int(&term)
+        let val: i64 = FromPyObject::extract(self.py, term)?;
+        return self.write_int(val)
       },
       "float" => {
         let val: f64 = FromPyObject::extract(self.py, term)?;
@@ -116,7 +117,8 @@ impl<'a> Encoder<'a> {
         let repr1 = h1.call(self.py, (py_term, ), None)?;
         return self.encode(&repr1)
       },
-      None => match py_term.getattr(self.py, "__etf__") {
+      None =>
+        match py_term.getattr(self.py, "__etf__") {
         Ok(h2) => {
           let repr2 = h2.call(self.py, NoArgs, None)?;
           return self.encode(&repr2)
@@ -149,9 +151,11 @@ impl<'a> Encoder<'a> {
   #[inline]
   fn write_list_no_tail(&mut self, list: &PyList) -> CodecResult<()> {
     let size = list.len(self.py);
-    self.data.push(consts::TAG_LIST_EXT);
-    self.data.write_u32::<BigEndian>(size as u32);
-
+    if size as u32 > 0 {
+      self.data.push(consts::TAG_LIST_EXT);
+      self.data.write_u32::<BigEndian>(size as u32);
+    } 
+    
     for i in 0..size {
       let item = list.get_item(self.py, i);
       self.encode(&item);
@@ -195,46 +199,7 @@ impl<'a> Encoder<'a> {
 
 
   #[inline]
-  fn write_int(&mut self, val: &PyObject) -> CodecResult<()> {
-    let size: u64 = val.call_method(self.py, "bit_length", NoArgs, None)?.extract(self.py)?;
-    let size: u32 = (size / 8 + 1) as u32;
-    if size <= 4 {
-      let v: i64 = FromPyObject::extract(self.py, val)?;
-      self.write_4byte_int(v)
-    } else {
-      self.write_arbitrary_int(val, size)
-    }
-  }
-
-  fn write_arbitrary_int(&mut self, val: &PyObject, size: u32) -> CodecResult<()> {
-    if size < 256 {
-      self.data.push(consts::TAG_SMALL_BIG_EXT);
-      self.data.push(size as u8);
-    } else {
-      self.data.push(consts::TAG_LARGE_BIG_EXT);
-      self.data.write_u32::<BigEndian>(size);
-    }
-
-    let ltz: bool = val.call_method(self.py, "__lt__", (0, ), None)?.extract(self.py)?;
-    if ltz {
-      self.data.push(1 as u8); // we have a negative value
-      // we make new object that we multiply with -1 to switch sign, so that we get a positive
-      // value to pack
-      let r: PyObject = val.call_method(self.py, "__mul__", (-1, ), None)?.extract(self.py)?;
-      let b: PyBytes = r.call_method(self.py, "to_bytes", (size, "little"), None)?.extract(self.py)?;
-      let data: &[u8] = b.data(self.py);
-      self.data.write(data);
-    } else {
-      self.data.push( 0 as u8);
-      let b: PyBytes = val.call_method(self.py, "to_bytes", (size, "little"), None)?.extract(self.py)?;
-      let data: &[u8] = b.data(self.py);
-      self.data.write(data);
-    }
-    Ok(())
-  }
-
-  #[inline]
-  fn write_4byte_int(&mut self, val: i64) -> CodecResult<()> {
+  fn write_int(&mut self, val: i64) -> CodecResult<()> {
     if val >= 0 && val <= u8::MAX as i64 {
       self.data.push(consts::TAG_SMALL_UINT);
       self.data.push(val as u8);
@@ -243,7 +208,22 @@ impl<'a> Encoder<'a> {
       self.data.push(consts::TAG_INT);
       self.data.write_i32::<BigEndian>(val as i32);
     } else {
-      return Err(CodecError::IntegerEncodingRange {i: val})
+       self.data.push(consts::TAG_SMALL_BIG_EXT);
+       let mut n = 1;
+       let mut s = 1;
+       let mut sign = 0;
+       if val < 0 { sign = 1; }
+       while s*256 < val  {
+           s = s*256;
+           n = n+1;
+       }
+       self.data.push(n as u8);
+       self.data.push(sign as u8);
+       let mut v = val.abs();
+       while v > 0 {
+          self.data.push((v % 256) as u8);
+          v = v/256;
+       }
     }
 
     Ok(())
@@ -297,22 +277,10 @@ impl<'a> Encoder<'a> {
     let str_byte_length: usize = byte_array.len();
     let can_be_encoded_as_bytes = can_be_encoded_as_byte_string(&text);
 
-    if str_byte_length <= u8::MAX as usize && can_be_encoded_as_bytes {
-      // Create an optimised byte-array structure and push bytes
-      self.data.push(consts::TAG_STRING_EXT);
-      self.data.write_u16::<BigEndian>(str_byte_length as u16); // 16bit length
-      self.data.write(byte_array); // write &[u8] string content
-    } else {
-      // Create a list structure and push each codepoint as an integer
-      self.data.push(consts::TAG_LIST_EXT);
-      let chars_count = text.chars().count();
-      self.data.write_u32::<BigEndian>(chars_count as u32); // chars, not bytes!
-      for (_i, ch) in text.char_indices() {
-        self.write_4byte_int(ch as i64)?
-      }
-      self.data.push(consts::TAG_NIL_EXT) // list terminator
-    }
-
+    self.data.push(consts::TAG_BINARY_EXT);
+    self.data.write_i32::<BigEndian>(str_byte_length as i32); // 16bit length
+    self.data.write(byte_array); // write &[u8] string content
+    
     Ok(())
   }
 

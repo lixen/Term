@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
+use std::io::{self, Write};
 use cpython::*;
 use byte::BytesExt;
 use byte::ctx::Str;
@@ -129,16 +129,7 @@ impl <'a> Decoder<'a> {
       consts::TAG_STRING_EXT => self.parse_string(tail), // 16-bit sz bytestr
       consts::TAG_SMALL_UINT => self.parse_number::<u8>(tail),
       consts::TAG_INT => self.parse_number::<i32>(tail),
-      consts::TAG_SMALL_BIG_EXT => {
-        let size = tail[0] as usize;
-        let sign: u8 = tail[1];
-        self.parse_arbitrary_length_int(&in_bytes[3..], size, sign)
-      },
-      consts::TAG_LARGE_BIG_EXT => {
-        let size: u32 = tail.read_with::<u32>(&mut 0usize, byte::BE)?;
-        let sign: u8 = tail[4];
-        self.parse_arbitrary_length_int(&in_bytes[6..], size as usize, sign)
-      },
+      consts::TAG_SMALL_BIG_EXT => self.parse_bint(tail),
       consts::TAG_NEW_FLOAT_EXT => self.parse_number::<f64>(tail),
       consts::TAG_MAP_EXT => self.parse_map(tail),
       consts::TAG_SMALL_TUPLE_EXT => {
@@ -244,6 +235,29 @@ impl <'a> Decoder<'a> {
   }
 
 
+
+  fn parse_bint<'inp>(&self, in_bytes: &'inp [u8])
+    -> CodecResult<(PyObject, &'inp [u8])>
+  {
+    let offset = &mut 0usize;
+    let sz = in_bytes.read_with::<u8>(offset, byte::BE)? as usize;
+    let sign = in_bytes.read_with::<u8>(offset, byte::BE)?;
+    let bin = &in_bytes[*offset..(*offset+sz)];
+    let mut val= 0;
+    let mut base = 1;
+    for x in 0..sz {
+        val = val + base*(bin[x] as i64);
+        base = base*256;
+    }
+    if sign == 1 {
+        val = val*-1;
+    }
+    *offset += sz;
+    let py_bytes = val.to_py_object(self.py);
+    Ok((py_bytes.into_object(), &in_bytes[*offset..]))
+  }
+
+
 //  #[inline]
 //  fn parse_bin_float<'inp>(&self, in_bytes: &'inp [u8]) -> CodecResult<(PyObject, &'inp [u8])>
 //  {
@@ -285,6 +299,8 @@ impl <'a> Decoder<'a> {
         return Ok(t.into_object())
       },
       "undefined" => return Ok(self.py.None()),
+      _ => {},
+      "null" => return Ok(self.py.None()),
       _ => {}
     }
 
@@ -307,31 +323,29 @@ impl <'a> Decoder<'a> {
   }
 
 
-  #[inline]
-  fn parse_arbitrary_length_int<'inp>(&self, in_bytes: &'inp [u8], size: usize, sign: u8) -> CodecResult<(PyObject, &'inp [u8])> {
-    let offset = &mut 0usize;
-    if *offset + size > in_bytes.len() {
-      return Err(CodecError::BinaryInputTooShort)
-    }
-    let bin = &in_bytes[*offset..(*offset+size)];
-    let data = PyBytes::new(self.py, bin);
-    let builtins = self.py.import("builtins")?;
-    let py_int = builtins.get(self.py, "int")?;
-    let val = py_int.call_method(self.py, "from_bytes", (data, "little"), None)?;
-    let val = if sign == 0 {
-        val
-    } else {
-      val.call_method(self.py, "__mul__", (-1, ), None)?
-    };
-
-    *offset += size;
-    let remaining = &in_bytes[*offset..];
-    Ok((val.into_object(), remaining))
-  }
   /// Given input _after_ binary tag, parse remaining bytes
   #[inline]
-  fn parse_binary<'inp>(&self, in_bytes: &'inp [u8]) -> CodecResult<(PyObject, &'inp [u8])>
+  fn parse_string<'inp>(&mut self, in_bytes: &'inp [u8]) -> CodecResult<(PyObject, &'inp [u8])>
   {
+    let offset = &mut 0usize;
+    let sz = in_bytes.read_with::<u16>(offset, byte::BE)? as usize;
+    if *offset + sz > in_bytes.len() {
+      return Err(CodecError::StrInputTooShort)
+    }
+
+    let mut lst = Vec::<PyObject>::with_capacity(sz);
+    for i in 0..sz {
+      let n = in_bytes[i+2]; // compensate for 16-bit length thing
+      let nlist = [97, n];
+      let (mut val, _) = self.decode(&nlist)?;
+      lst.push(val);
+    }
+
+    let py_lst = PyList::new(self.py, lst.as_ref());
+    *offset += sz;
+    Ok((py_lst.into_object(), &in_bytes[*offset..]))
+
+/*
     let offset = &mut 0usize;
     let sz = in_bytes.read_with::<u32>(offset, byte::BE)? as usize;
     if *offset + sz > in_bytes.len() {
@@ -343,6 +357,7 @@ impl <'a> Decoder<'a> {
     *offset += sz;
     let remaining = &in_bytes[*offset..];
     Ok((py_bytes.into_object(), remaining))
+*/
   }
 
 
@@ -371,36 +386,33 @@ impl <'a> Decoder<'a> {
                                  ]);
     Ok((py_result.into_object(), remaining))
   }
-
-
+ 
   /// Given input _after_ string tag, parse remaining bytes as an ASCII string
-  #[inline]
-  fn parse_string<'inp>(&self, in_bytes: &'inp [u8]) -> CodecResult<(PyObject, &'inp [u8])>
+#[inline]
+  fn parse_binary<'inp>(&mut self, in_bytes: &'inp [u8]) -> CodecResult<(PyObject, &'inp [u8])>
   {
     let offset = &mut 0usize;
-    let sz = in_bytes.read_with::<u16>(offset, byte::BE)? as usize;
+    let sz = in_bytes.read_with::<u32>(offset, byte::BE)? as usize;
     if *offset + sz > in_bytes.len() {
       return Err(CodecError::StrInputTooShort)
     }
-
-    let result = match self.bytestring_repr {
-      ByteStringRepresentation::Str => {
-        let rust_str = in_bytes.read_with::<&str>(
-          offset, Str::Len(sz as usize)
-        )?;
-        PyString::new(self.py, rust_str).into_object()
+    let builtins = self.py.import("builtins")?;
+    let py_str = builtins.get(self.py,"str")?;
+    let offset1 = *offset;
+    *offset += sz;
+    let result = PyBytes::new(self.py, &in_bytes[offset1..(offset1 + sz)]);
+    let tmp = py_str.call(self.py, (&result, "utf8"), None);
+    let result = match tmp {
+      Ok(Value) => {
+        Value
       },
-      ByteStringRepresentation::Bytes => {
-        let offset1 = *offset;
-        *offset += sz;
-        PyBytes::new(self.py, &in_bytes[offset1..(offset1 + sz)]).into_object()
+      Err(E) => {
+        result.into_object()
       },
     };
-
     let remaining = &in_bytes[*offset..];
     Ok((result, remaining))
-  }
-
+    }
 
   /// Given input _after_ the list tag, parse the list elements and tail
   #[inline]
@@ -441,7 +453,7 @@ impl <'a> Decoder<'a> {
     let offset = &mut 0usize;
     let arity = in_bytes.read_with::<u32>(offset, byte::BE)? as usize;
 
-    let mut result = PyDict::new(self.py);
+    let result = PyDict::new(self.py);
 
     // Read key/value pairs two at a time
     let mut tail = &in_bytes[*offset..];
